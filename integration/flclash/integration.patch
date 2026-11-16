@@ -1,0 +1,503 @@
+diff --git a/lib/application.dart b/lib/application.dart
+index e1416c3..5640540 100644
+--- a/lib/application.dart
++++ b/lib/application.dart
+@@ -3,6 +3,8 @@ import 'dart:io';
+ 
+ import 'package:connectivity_plus/connectivity_plus.dart';
+ import 'package:fl_clash/common/common.dart';
++import 'package:fl_clash/common/control_bridge.dart';
++import 'package:fl_clash/enum/enum.dart' show LogLevel;
+ import 'package:fl_clash/core/core.dart';
+ import 'package:fl_clash/l10n/l10n.dart';
+ import 'package:fl_clash/manager/hotkey_manager.dart';
+@@ -25,6 +27,7 @@ class Application extends ConsumerStatefulWidget {
+ 
+ class ApplicationState extends ConsumerState<Application> {
+   Timer? _autoUpdateProfilesTaskTimer;
++  ControlBridge? _controlBridge;
+   bool _preHasVpn = false;
+ 
+   final _pageTransitionsTheme = const PageTransitionsTheme(
+@@ -52,6 +55,15 @@ class ApplicationState extends ConsumerState<Application> {
+       } else {
+         exit(0);
+       }
++      if (enableControlBridge && Platform.isWindows) {
++        _controlBridge = ControlBridge();
++        try {
++          await _controlBridge!.start();
++        } catch (_) {
++          // Keep native GUI operation available if the optional bridge fails.
++          commonPrint.log('Control bridge startup failed', logLevel: LogLevel.warning);
++        }
++      }
+       _autoUpdateProfilesTask();
+       _initLink();
+       app?.initShortcuts();
+@@ -186,6 +198,8 @@ class ApplicationState extends ConsumerState<Application> {
+ 
+   @override
+   Future<void> dispose() async {
++    await _controlBridge?.close();
++    _controlBridge = null;
+     linkManager.destroy();
+     _autoUpdateProfilesTaskTimer?.cancel();
+     await coreController.destroy();
+diff --git a/lib/common/proxy.dart b/lib/common/proxy.dart
+index 6e66f49..dc028ae 100644
+--- a/lib/common/proxy.dart
++++ b/lib/common/proxy.dart
+@@ -1,4 +1,19 @@
+ import 'package:fl_clash/common/system.dart';
++import 'package:fl_clash/models/models.dart' show ProxyState;
+ import 'package:proxy/proxy.dart';
+ 
+ final proxy = system.isDesktop ? Proxy() : null;
++
++Future<void> _pendingSystemProxyUpdate = Future<void>.value();
++
++/// Shared queue for GUI listeners and the authenticated control bridge.
++Future<bool> applySystemProxyState(ProxyState state) {
++  final operation = _pendingSystemProxyUpdate.then((_) async {
++    final result = state.isStart && state.systemProxy
++        ? await proxy?.startProxy(state.port, state.bassDomain)
++        : await proxy?.stopProxy();
++    return result == true;
++  });
++  _pendingSystemProxyUpdate = operation.then<void>((_) {}, onError: (Object _) {});
++  return operation;
++}
+diff --git a/lib/core/controller.dart b/lib/core/controller.dart
+index 5dd04ce..d5c0a5c 100644
+--- a/lib/core/controller.dart
++++ b/lib/core/controller.dart
+@@ -103,13 +103,17 @@ class CoreController {
+   Future<String> setupConfig({
+     required SetupParams params,
+     required SetupState setupState,
+-    VoidCallback? preloadInvoke,
++    FutureOr<void> Function()? preloadInvoke,
+   }) async {
+-    final res = _interface.setupConfig(params);
+-    if (preloadInvoke != null) {
+-      preloadInvoke();
+-    }
+-    return res;
++    final setup = Future<String>.sync(() => _interface.setupConfig(params));
++    if (preloadInvoke == null) return setup;
++    // Setup and listener startup may overlap, but both results must settle
++    // before returning. Future.wait observes both errors if either fails.
++    final results = await Future.wait<String>([
++      setup,
++      Future<void>.sync(preloadInvoke).then((_) => ''),
++    ]);
++    return results.first;
+   }
+ 
+   Future<List<Group>> getProxiesGroups({
+diff --git a/lib/core/interface.dart b/lib/core/interface.dart
+index 4123cb6..e450f69 100644
+--- a/lib/core/interface.dart
++++ b/lib/core/interface.dart
+@@ -152,11 +152,14 @@ abstract class CoreHandlerInterface with CoreInterface {
+ 
+   @override
+   Future<String> updateConfig(UpdateParams updateParams) async {
+-    return await _invoke<String>(
+-          method: ActionMethod.updateConfig,
+-          data: json.encode(updateParams),
+-        ) ??
+-        '';
++    final result = await _invoke<String>(
++      method: ActionMethod.updateConfig,
++      data: json.encode(updateParams),
++    );
++    if (result == null) {
++      throw StateError('Native config update did not return a result');
++    }
++    return result;
+   }
+ 
+   @override
+@@ -167,11 +170,14 @@ abstract class CoreHandlerInterface with CoreInterface {
+ 
+   @override
+   Future<String> setupConfig(SetupParams setupParams) async {
+-    return await _invoke<String>(
+-          method: ActionMethod.setupConfig,
+-          data: json.encode(setupParams),
+-        ) ??
+-        '';
++    final result = await _invoke<String>(
++      method: ActionMethod.setupConfig,
++      data: json.encode(setupParams),
++    );
++    if (result == null) {
++      throw StateError('Native config setup did not return a result');
++    }
++    return result;
+   }
+ 
+   @override
+diff --git a/lib/manager/proxy_manager.dart b/lib/manager/proxy_manager.dart
+index 9bad724..689d7b1 100644
+--- a/lib/manager/proxy_manager.dart
++++ b/lib/manager/proxy_manager.dart
+@@ -16,27 +16,15 @@ class ProxyManager extends ConsumerStatefulWidget {
+ }
+ 
+ class _ProxyManagerState extends ConsumerState<ProxyManager> {
+-  Future<void> _pendingUpdate = Future.value();
+-
+   Future<void> _updateProxy(ProxyState proxyState) async {
+-    final isStart = proxyState.isStart;
+-    final systemProxy = proxyState.systemProxy;
+-    final port = proxyState.port;
+-    bool? result;
+-    if (isStart && systemProxy) {
+-      result = await proxy?.startProxy(port, proxyState.bassDomain);
+-    } else {
+-      result = await proxy?.stopProxy();
+-    }
++    final result = await applySystemProxyState(proxyState);
+     if (result == false) {
+       commonPrint.log('update system proxy failed', logLevel: LogLevel.warning);
+     }
+   }
+ 
+   void _scheduleUpdateProxy(ProxyState proxyState) {
+-    _pendingUpdate = _pendingUpdate
+-        .then((_) => _updateProxy(proxyState))
+-        .catchError((Object error) {
++    _updateProxy(proxyState).catchError((Object error) {
+           commonPrint.log(
+             'update system proxy failed: $error',
+             logLevel: LogLevel.warning,
+diff --git a/lib/providers/action.dart b/lib/providers/action.dart
+index 7baf821..0a99149 100644
+--- a/lib/providers/action.dart
++++ b/lib/providers/action.dart
+@@ -137,13 +137,17 @@ class SetupAction extends _$SetupAction {
+   }
+ 
+   Future<void> _handleStart() async {
++    if (!ref.read(suspendProvider)) {
++      final started = await coreController.startListener();
++      if (!started) {
++        throw StateError('Native listeners did not start');
++      }
++    }
+     startTime ??= DateTime.now();
+     //The local status must be updated when performing the run task
+     ref.read(commonActionProvider.notifier).updateRunTime();
+     ref.read(commonActionProvider.notifier).updateTraffic();
+-    if (!ref.read(suspendProvider)) {
+-      await coreController.startListener();
+-    }
++    _updateTimer?.cancel();
+     _updateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+       ref.read(commonActionProvider.notifier).updateRunTime();
+       ref.read(commonActionProvider.notifier).updateTraffic();
+@@ -155,10 +159,13 @@ class SetupAction extends _$SetupAction {
+   }
+ 
+   Future handleStop() async {
++    final stopped = await coreController.stopListener();
++    if (!stopped) {
++      throw StateError('Native listeners did not stop');
++    }
+     startTime = null;
+     _updateTimer?.cancel();
+     _updateTimer = null;
+-    await coreController.stopListener();
+   }
+ 
+   Future<void> initStatus() async {
+@@ -180,19 +187,31 @@ class SetupAction extends _$SetupAction {
+     }
+   }
+ 
+-  Future<void> updateStatus(bool isStart, {bool isInit = false}) async {
++  Future<void> updateStatus(
++    bool isStart, {
++    bool isInit = false,
++    bool strict = false,
++  }) async {
+     if (isStart) {
+       if (!isInit) {
+-        final res = await ref
+-            .read(coreActionProvider.notifier)
+-            .tryStartCore(true);
++        final core = ref.read(coreActionProvider.notifier);
++        final res = strict
++            ? await core.tryStartCoreForControl(true)
++            : await core.tryStartCore(true);
+         if (res) return;
+         if (!ref.read(initProvider)) return;
+-        await _handleStart();
+-        applyProfileDebounce(force: true, silence: true);
++        if (strict) {
++          await _startWithStrictProfile();
++        } else {
++          await _handleStart();
++          applyProfileDebounce(force: true, silence: true);
++        }
+       } else {
+         globalState.needInitStatus = false;
+-        ref.read(runTimeProvider.notifier).value = 0;
++        if (strict) {
++          await _startWithStrictProfile();
++          return;
++        }
+         try {
+           await applyProfile(
+             force: true,
+@@ -214,18 +233,52 @@ class SetupAction extends _$SetupAction {
+     }
+   }
+ 
++  Future<void> _pendingControlUpdate = Future<void>.value();
++
++  void _clearRunState() {
++    startTime = null;
++    _updateTimer?.cancel();
++    _updateTimer = null;
++    ref.read(runTimeProvider.notifier).value = null;
++  }
++
++  Future<void> _startWithStrictProfile() async {
++    try {
++      await applyProfile(
++        force: true,
++        strict: true,
++        preloadInvoke: _handleStart,
++      );
++    } catch (_) {
++      try {
++        await coreController.stopListener();
++      } catch (_) {}
++      _clearRunState();
++      rethrow;
++    }
++  }
++
++  /// Await the same native authorization and complete config update used by
++  /// GUI switches. Unlike updateConfigDebounce, completion is observable.
++  Future<void> applyControlUpdate({bool strict = false}) {
++    final result = _pendingControlUpdate.then((_) async {
++      final updateParams = ref.read(updateParamsProvider);
++      final res = await _requestAdmin(updateParams.tun.enable, strict: strict);
++      if (res.isError) return;
++      final realTunEnable = ref.read(realTunEnableProvider);
++      final message = await coreController.updateConfig(
++        updateParams.copyWith.tun(enable: realTunEnable),
++      );
++      if (message.isNotEmpty) throw StateError('Native config update failed');
++    });
++    // A failed action must not poison subsequent native GUI or bridge updates.
++    _pendingControlUpdate = result.then<void>((_) {}, onError: (Object _) {});
++    return result;
++  }
++
+   Future<void> updateConfigDebounce() async {
+     debouncer.call(FunctionTag.updateConfig, () async {
+-      await globalState.safeRun(() async {
+-        final updateParams = ref.read(updateParamsProvider);
+-        final res = await _requestAdmin(updateParams.tun.enable);
+-        if (res.isError) return;
+-        final realTunEnable = ref.read(realTunEnableProvider);
+-        final message = await coreController.updateConfig(
+-          updateParams.copyWith.tun(enable: realTunEnable),
+-        );
+-        if (message.isNotEmpty) throw message;
+-      });
++      await globalState.safeRun(applyControlUpdate);
+     });
+   }
+ 
+@@ -266,11 +319,13 @@ class SetupAction extends _$SetupAction {
+   Future<void> applyProfile({
+     bool silence = false,
+     bool force = false,
+-    VoidCallback? preloadInvoke,
++    bool strict = false,
++    FutureOr<void> Function()? preloadInvoke,
+   }) async {
+     await _setupConfig(
+       force: force,
+       silence: silence,
++      strict: strict,
+       preloadInvoke: preloadInvoke,
+       onUpdated: () async {
+         await ref.read(proxiesActionProvider.notifier).updateGroups();
+@@ -347,17 +402,25 @@ class SetupAction extends _$SetupAction {
+     return '';
+   }
+ 
+-  Future<Result<bool>> _requestAdmin(bool enableTun) async {
++  Future<Result<bool>> _requestAdmin(
++    bool enableTun, {
++    bool strict = false,
++  }) async {
+     final realTunEnable = ref.read(realTunEnableProvider);
+     if (enableTun != realTunEnable && realTunEnable == false) {
+       final code = await system.authorizeCore();
+       switch (code) {
+         case AuthorizeCode.success:
++          if (strict) {
++            await ref.read(coreActionProvider.notifier).restartCoreForControl();
++            return Result.success(enableTun);
++          }
+           await ref.read(coreActionProvider.notifier).restartCore();
+           return Result.error('');
+         case AuthorizeCode.none:
+           break;
+         case AuthorizeCode.error:
++          if (strict) throw StateError('Native TUN authorization failed');
+           enableTun = false;
+           break;
+       }
+@@ -369,7 +432,8 @@ class SetupAction extends _$SetupAction {
+   Future<void> _setupConfig({
+     bool force = false,
+     bool silence = false,
+-    VoidCallback? preloadInvoke,
++    bool strict = false,
++    FutureOr<void> Function()? preloadInvoke,
+     FutureOr Function()? onUpdated,
+   }) async {
+     var profile = ref.read(currentProfileProvider);
+@@ -380,7 +444,7 @@ class SetupAction extends _$SetupAction {
+     }
+     commonPrint.log('setup ===> ${profile?.id}');
+     final patchConfig = ref.read(patchClashConfigProvider);
+-    final res = await _requestAdmin(patchConfig.tun.enable);
++    final res = await _requestAdmin(patchConfig.tun.enable, strict: strict);
+     if (res.isError) return;
+     final realTunEnable = ref.read(realTunEnableProvider);
+     final realPatchConfig = patchConfig.copyWith.tun(enable: realTunEnable);
+@@ -397,22 +461,29 @@ class SetupAction extends _$SetupAction {
+     final yamlString = vm2.a;
+     final yamlMd5 = vm2.b;
+     if (yamlMd5 == globalState.lastConfigMd5 && force == false) return;
++    Future<void> applyNativeProfile() async {
++      final configFilePath = await appPath.configFilePath;
++      await File(configFilePath).safeWriteAsString(yamlString);
++      if (!strict) globalState.lastConfigMd5 = yamlMd5;
++      final message = await coreController.setupConfig(
++        setupState: setupState,
++        params: _setupParams,
++        preloadInvoke: preloadInvoke,
++      );
++      if (message.isNotEmpty && (strict || !message.endsWith('is empty'))) {
++        throw message;
++      }
++      globalState.lastConfigMd5 = yamlMd5;
++      ref.read(checkIpNumProvider.notifier).add();
++      await onUpdated?.call();
++    }
++
++    if (strict) {
++      await applyNativeProfile();
++      return;
++    }
+     await globalState.loadingRun(
+-      () async {
+-        final configFilePath = await appPath.configFilePath;
+-        await File(configFilePath).safeWriteAsString(yamlString);
+-        globalState.lastConfigMd5 = yamlMd5;
+-        final message = await coreController.setupConfig(
+-          setupState: setupState,
+-          params: _setupParams,
+-          preloadInvoke: preloadInvoke,
+-        );
+-        if (message.isNotEmpty && !message.endsWith('is empty')) {
+-          throw message;
+-        }
+-        ref.read(checkIpNumProvider.notifier).add();
+-        await onUpdated?.call();
+-      },
++      applyNativeProfile,
+       silence: true,
+       tag: !silence ? LoadingTag.proxies : null,
+     );
+@@ -532,18 +603,53 @@ class CoreAction extends _$CoreAction {
+   }
+ 
+   Future<void> restartCore([bool start = false]) async {
+-    final isDisconnected =
+-        ref.read(coreStatusProvider) == CoreStatus.disconnected;
+-    ref.read(coreStatusProvider.notifier).value = CoreStatus.disconnected;
+-    await coreController.shutdown(!isDisconnected);
+-    await connectCore();
+-    await initCore();
+-    if (start || ref.read(isStartProvider)) {
+-      await ref
+-          .read(setupActionProvider.notifier)
+-          .updateStatus(true, isInit: true);
+-    } else {
+-      await ref.read(setupActionProvider.notifier).applyProfile(force: true);
++    await _restartCore(start);
++  }
++
++  /// Await and propagate every native step for authenticated control clients.
++  Future<void> restartCoreForControl([bool start = false]) async {
++    await _restartCore(start, strict: true);
++  }
++
++  Future<void> _restartCore(bool start, {bool strict = false}) async {
++    final shouldStart = start || ref.read(isStartProvider);
++    if (strict) {
++      final setup = ref.read(setupActionProvider.notifier);
++      setup._clearRunState();
++    }
++    try {
++      final isDisconnected =
++          ref.read(coreStatusProvider) == CoreStatus.disconnected;
++      ref.read(coreStatusProvider.notifier).value = CoreStatus.disconnected;
++      await coreController.shutdown(!isDisconnected);
++      await connectCore();
++      if (strict && ref.read(coreStatusProvider) != CoreStatus.connected) {
++        throw StateError('Native core connection failed');
++      }
++      await initCore();
++      if (strict && !await coreController.isInit) {
++        throw StateError('Native core initialization failed');
++      }
++      if (strict ? shouldStart : start || ref.read(isStartProvider)) {
++        await ref
++            .read(setupActionProvider.notifier)
++            .updateStatus(true, isInit: true, strict: strict);
++      } else {
++        await ref
++            .read(setupActionProvider.notifier)
++            .applyProfile(force: true, strict: strict);
++      }
++    } catch (_) {
++      if (strict) {
++        // A failed profile can follow a successful listener start. Stop that
++        // partial state without hiding the original failure from the client.
++        try {
++          await coreController.stopListener();
++        } catch (_) {}
++        final setup = ref.read(setupActionProvider.notifier);
++        setup._clearRunState();
++      }
++      rethrow;
+     }
+   }
+ 
+@@ -553,6 +659,12 @@ class CoreAction extends _$CoreAction {
+     return true;
+   }
+ 
++  Future<bool> tryStartCoreForControl(bool start) async {
++    if (coreController.isCompleted) return false;
++    await restartCoreForControl(start);
++    return true;
++  }
++
+   void handleCoreDisconnected() {
+     ref.read(coreStatusProvider.notifier).value = CoreStatus.disconnected;
+   }
