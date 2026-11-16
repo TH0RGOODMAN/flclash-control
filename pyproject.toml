@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flclash-control"
+version = "0.1.0"
+description = "CLI and MCP control for a running FlClash Windows GUI"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+dependencies = ["httpx>=0.28,<1", "mcp>=2,<3", "pywin32>=311; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+flclash-control = "flclash_control.cli:main"
+flclash-control-mcp = "flclash_control.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flclash_control"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
