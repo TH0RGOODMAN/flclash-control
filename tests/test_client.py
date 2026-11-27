@@ -1,4 +1,4 @@
-"""Client contract tests using disposable DPAPI state and an in-memory HTTP server."""
+"""Client, CLI, and MCP contract tests using disposable DPAPI state and in-memory HTTP transport."""
 from __future__ import annotations
 
 import asyncio
@@ -6,10 +6,11 @@ import json
 import secrets
 
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 import pytest
 
-from flclash_control import client as client_module
-from flclash_control.client import ControlClient, ControlError, PORT
+from flclash_control import cli, client as client_module, mcp_server
+from flclash_control.client import PORT, ControlClient, ControlError
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def local_state(tmp_path):
     win32crypt = pytest.importorskip("win32crypt")
     token = secrets.token_urlsafe(32)
     encrypted = win32crypt.CryptProtectData(
-        token.encode(), "FlClash Control test", None, None, None, 0
+        token.encode("utf-8"), "FlClash Control test", None, None, None, 0
     )
     path = tmp_path / "gui-bridge.json"
     state = {
@@ -74,6 +75,27 @@ def test_command_body_mapping(local_state, action, params, wire_action):
     assert make_client(local_state, handler).call(action, params) == {}
 
 
+def test_client_side_parameter_validation_stops_before_network(local_state):
+    seen = []
+    client = make_client(local_state, lambda req: seen.append(req))
+    with pytest.raises(ControlError) as bad_action:
+        client.call("arbitrary_rpc")
+    assert bad_action.value.code == "unknown_action"
+
+    with pytest.raises(ControlError) as bad_mode:
+        client.call("mode", {"mode": "invalid"})
+    assert bad_mode.value.code == "invalid_mode"
+
+    with pytest.raises(ControlError) as bad_bool:
+        client.call("tun", {"enabled": "yes"})
+    assert bad_bool.value.code == "boolean_parameter_required"
+
+    with pytest.raises(ControlError) as extra_param:
+        client.call("status", {"unexpected": 1})
+    assert extra_param.value.code == "unexpected_parameter"
+    assert seen == []
+
+
 def test_http_client_ignores_environment_proxies(local_state, monkeypatch):
     monkeypatch.setenv("HTTP_PROXY", "http://192.0.2.1:1")
     monkeypatch.setenv("HTTPS_PROXY", "http://192.0.2.1:1")
@@ -98,10 +120,34 @@ def test_http_client_ignores_environment_proxies(local_state, monkeypatch):
 @pytest.mark.parametrize("status", [401, 403, 409, 500])
 def test_http_failure_does_not_echo_response_or_token(local_state, status):
     secret = local_state[1]
-    client = make_client(local_state, lambda _: httpx.Response(status, text=secret))
+    client = make_client(
+        local_state,
+        lambda _: httpx.Response(status, json={"ok": False, "error": secret, "detail": secret}),
+    )
     with pytest.raises(ControlError) as failure:
         client.call("status")
     assert secret not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "bridge_code"),
+    [
+        (409, "tun_authorization_or_apply_failed"),
+        (409, "gui_not_initialized"),
+        (429, "command_queue_full"),
+        (503, "bridge_closing"),
+        (500, "native_action_failed"),
+    ],
+)
+def test_known_bridge_error_codes_produce_actionable_diagnostics(local_state, status, bridge_code):
+    client = make_client(
+        local_state,
+        lambda _: httpx.Response(status, json={"ok": False, "error": bridge_code}),
+    )
+    with pytest.raises(ControlError) as failure:
+        client.call("restart")
+    assert failure.value.code == bridge_code
+    assert bridge_code in str(failure.value)
 
 
 def test_redirect_is_not_followed(local_state):
@@ -185,29 +231,145 @@ def test_missing_local_state_is_controlled_error(tmp_path):
         ControlClient(tmp_path / "missing.json").call("status")
 
 
-def test_mcp_catalog_exposes_only_gui_control_tools():
-    from flclash_control.mcp_server import mcp
+def test_health_and_doctor_diagnostics(local_state, tmp_path):
+    path, token, _ = local_state
 
-    tools = asyncio.run(mcp.list_tools())
-    assert {tool.name for tool in tools} == {
-        "flclash_status", "flclash_start", "flclash_stop", "flclash_restart_core",
-        "flclash_set_tun", "flclash_set_system_proxy", "flclash_set_mode",
-        "flclash_show_window", "flclash_exit",
+    def healthy_handler(request):
+        assert request.url == f"http://127.0.0.1:{PORT}/health"
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            json={"ok": True, "bridge": "flclash-gui-control", "protocol": 1, "pid": 1234},
+        )
+
+    client = ControlClient(path, transport=httpx.MockTransport(healthy_handler))
+    health = client.health()
+    assert health == {"ok": True, "bridge": "flclash-gui-control", "protocol": 1, "port": PORT, "pid": 1234}
+
+    diag = client.doctor()
+    assert diag["ok"] is True
+    assert diag["pid_matches"] is True
+    assert token not in json.dumps(diag)
+
+    mismatch_client = ControlClient(
+        path,
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={"ok": True, "bridge": "flclash-gui-control", "protocol": 1, "pid": 9999},
+            )
+        ),
+    )
+    mismatch = mismatch_client.doctor()
+    assert mismatch["ok"] is False and mismatch["pid_matches"] is False
+
+    missing_client = ControlClient(
+        tmp_path / "absent.json",
+        transport=httpx.MockTransport(lambda _: (_ for _ in ()).throw(httpx.ConnectError("closed"))),
+    )
+    missing_diag = missing_client.doctor()
+    assert missing_diag["ok"] is False and missing_diag["token_file_present"] is False
+
+
+def test_exit_and_wait_polls_until_bridge_closes(local_state):
+    health_calls = 0
+
+    def handler(request):
+        nonlocal health_calls
+        if request.url.path == "/command":
+            return httpx.Response(200, json={"ok": True, "data": {"exit_scheduled": True}})
+        health_calls += 1
+        if health_calls == 1:
+            return httpx.Response(
+                200,
+                json={"ok": True, "bridge": "flclash-gui-control", "protocol": 1, "pid": 1234},
+            )
+        raise httpx.ConnectError("process exited")
+
+    result = make_client(local_state, handler).exit_and_wait(wait_timeout=2.0, poll_interval=0.01)
+    assert result == {"exit_scheduled": True, "exited": True}
+    assert health_calls == 2
+
+
+def test_env_configuration_overrides(local_state, monkeypatch):
+    path, _, _ = local_state
+    monkeypatch.setenv("FLCLASH_CONTROL_TOKEN_FILE", str(path))
+    monkeypatch.setenv("FLCLASH_CONTROL_TIMEOUT", "12.5")
+    c = ControlClient()
+    assert c.token_path == path
+    assert c.timeout == 12.5
+
+    monkeypatch.setenv("FLCLASH_CONTROL_TIMEOUT", "-1")
+    with pytest.raises(ControlError) as bad_timeout:
+        ControlClient()
+    assert bad_timeout.value.code == "invalid_timeout"
+
+
+def test_cli_commands_and_error_exit_code(local_state, monkeypatch, capsys):
+    path, _, _ = local_state
+
+    class FakeClient:
+        def __init__(self, token_path=None, *, timeout=None):
+            self.token_path = token_path
+            self.timeout = timeout
+
+        def doctor(self):
+            return {"ok": True, "bridge_pid": 1234}
+
+        def call(self, action, params=None):
+            if action == "restart":
+                raise ControlError("Bridge busy", code="command_queue_full")
+            return {"action": action, "params": params or {}}
+
+    monkeypatch.setattr(cli, "ControlClient", FakeClient)
+    assert cli.main(["--token-file", str(path), "doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+    assert cli.main(["mode", "rule"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"action": "mode", "params": {"mode": "rule"}}
+
+    assert cli.main(["restart"]) == 1
+    assert "Bridge busy" in capsys.readouterr().err
+
+
+def test_mcp_catalog_annotations_schema_and_error_wrapping(monkeypatch):
+    tools = asyncio.run(mcp_server.mcp.list_tools())
+    by_name = {tool.name: tool for tool in tools}
+    assert set(by_name) == {
+        "flclash_health",
+        "flclash_status",
+        "flclash_start",
+        "flclash_stop",
+        "flclash_restart_core",
+        "flclash_set_tun",
+        "flclash_set_system_proxy",
+        "flclash_set_mode",
+        "flclash_show_window",
+        "flclash_exit",
     }
-    status = next(tool for tool in tools if tool.name == "flclash_status")
-    assert status.annotations.read_only_hint is True
+    for tool in tools:
+        assert tool.annotations is not None
+        assert tool.annotations.open_world_hint is False
 
-
-def test_mcp_system_proxy_mapping(monkeypatch):
-    from flclash_control import mcp_server
+    assert by_name["flclash_status"].annotations.read_only_hint is True
+    assert by_name["flclash_health"].annotations.read_only_hint is True
+    assert by_name["flclash_exit"].annotations.destructive_hint is True
+    assert by_name["flclash_show_window"].annotations.destructive_hint is False
+    mode_prop = by_name["flclash_set_mode"].input_schema["properties"]["mode"]
+    assert set(mode_prop["enum"]) == {"rule", "global", "direct"}
 
     calls = []
 
     class FakeClient:
         def call(self, action, params=None):
             calls.append((action, params))
+            if action == "restart":
+                raise ControlError("Bridge unavailable", code="bridge_unavailable")
             return {"system_proxy": True}
 
     monkeypatch.setattr(mcp_server, "ControlClient", FakeClient)
     assert mcp_server.flclash_set_system_proxy(True) == {"system_proxy": True}
     assert calls == [("system-proxy", {"enabled": True})]
+
+    with pytest.raises(ToolError, match="Bridge unavailable"):
+        mcp_server.flclash_restart_core()
